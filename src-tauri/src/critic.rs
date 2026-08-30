@@ -41,6 +41,9 @@ pub enum Violation {
     TooLong,
     /// More than one question at a time.
     MultipleQuestions,
+    /// Repeats what it already said. The model sees its own previous reply in
+    /// the history and copies it, which reads as not listening at all.
+    Repeats,
 }
 
 impl Violation {
@@ -67,6 +70,9 @@ impl Violation {
             }
             Violation::TooLong => "Слишком длинно. Две-четыре фразы.",
             Violation::MultipleQuestions => "Задай ровно один вопрос.",
+            Violation::Repeats => {
+                "Ты повторил то, что уже говорил. Человек ответил — отзовись на его последние слова, а не начинай заново."
+            }
         }
     }
 }
@@ -144,8 +150,22 @@ const MAX_SENTENCES: usize = 5;
 const MAX_CHARS: usize = 700;
 
 pub fn review(text: &str) -> Vec<Violation> {
+    review_in_context(text, None)
+}
+
+/// Reviews a reply against what was said just before it.
+///
+/// Without the previous reply the worst failure is invisible: the model
+/// restating its own last message word for word while the person answers it.
+pub fn review_in_context(text: &str, previous_reply: Option<&str>) -> Vec<Violation> {
     let lower = text.to_lowercase().replace('ё', "е");
     let mut found = Vec::new();
+
+    if let Some(previous) = previous_reply {
+        if repeats(text, previous) {
+            found.push(Violation::Repeats);
+        }
+    }
 
     if SYCOPHANCY.iter().any(|p| lower.contains(p)) {
         found.push(Violation::Sycophancy);
@@ -173,6 +193,32 @@ pub fn review(text: &str) -> Vec<Violation> {
     }
 
     found
+}
+
+/// Near-identical is still a repeat: models re-emit the same sentence with a
+/// comma moved, and that reads to a person as being ignored.
+fn repeats(text: &str, previous: &str) -> bool {
+    let a = squash(text);
+    let b = squash(previous);
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    let prefix = a.chars().take(40).collect::<String>();
+    prefix.chars().count() >= 20 && b.starts_with(&prefix)
+}
+
+fn squash(text: &str) -> String {
+    text.to_lowercase()
+        .replace('ё', "е")
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn has_bullet_list(text: &str) -> bool {
@@ -253,6 +299,33 @@ mod tests {
         let also_good =
             "Вы говорите, что ничего никогда не выходит, но на прошлой неделе прогулка состоялась. Что было по-другому в тот день?";
         assert!(review(also_good).is_empty(), "{:?}", review(also_good));
+    }
+
+    /// Reproduces what a user actually saw: the same sentence three times in a
+    /// row while they answered it, including after "я такого не говорил".
+    #[test]
+    fn catches_a_repeated_reply() {
+        let said = "Вы сказали, что по вечерам не можете заставить себя выйти из дома. Понятно. А что именно мешает вам это делать?";
+
+        assert!(
+            review_in_context(said, Some(said)).contains(&Violation::Repeats),
+            "an identical reply must be rejected"
+        );
+
+        // Same sentence with punctuation shuffled is still a repeat.
+        let nearly = "Вы сказали, что по вечерам не можете заставить себя выйти из дома! Понятно — а что именно мешает?";
+        assert!(review_in_context(nearly, Some(said)).contains(&Violation::Repeats));
+
+        // A genuinely new reply is not.
+        let moved_on = "Хорошо, тогда расскажите своими словами, что вас беспокоит.";
+        assert!(!review_in_context(moved_on, Some(said)).contains(&Violation::Repeats));
+    }
+
+    #[test]
+    fn without_context_repetition_cannot_be_judged() {
+        let said = "Что помешало выйти вчера?";
+        assert!(!review(said).contains(&Violation::Repeats));
+        assert!(!review_in_context(said, None).contains(&Violation::Repeats));
     }
 
     #[test]

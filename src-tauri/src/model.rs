@@ -104,12 +104,24 @@ impl Ollama {
     /// failing one is regenerated with the objection attached, and a second
     /// failure falls back to a fixed question. See `critic`.
     pub async fn respond_reviewed(&self, state: &State, history: &[Message]) -> Result<String> {
-        const MAX_ATTEMPTS: usize = 2;
+        const MAX_ATTEMPTS: usize = 3;
+
+        let previous_reply = history
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .map(|m| m.content.clone());
+
         let mut objections: Vec<&'static str> = Vec::new();
 
-        for _ in 0..MAX_ATTEMPTS {
-            let reply = self.respond(state, history, &objections).await?;
-            let violations = crate::critic::review(&reply);
+        for attempt in 0..MAX_ATTEMPTS {
+            // Raising temperature on retries: at the original setting the model
+            // tends to produce the same rejected sentence again.
+            let temperature = 0.6 + 0.15 * attempt as f32;
+            let reply = self
+                .respond_at(state, history, &objections, temperature)
+                .await?;
+            let violations = crate::critic::review_in_context(&reply, previous_reply.as_deref());
             if violations.is_empty() {
                 return Ok(reply);
             }
@@ -128,6 +140,16 @@ impl Ollama {
         state: &State,
         history: &[Message],
         objections: &[&'static str],
+    ) -> Result<String> {
+        self.respond_at(state, history, objections, 0.6).await
+    }
+
+    async fn respond_at(
+        &self,
+        state: &State,
+        history: &[Message],
+        objections: &[&'static str],
+        temperature: f32,
     ) -> Result<String> {
         if !state.allows_generation() {
             bail!("generation is not allowed in state {}", state.name());
@@ -153,7 +175,7 @@ impl Ollama {
             messages: &messages,
             stream: false,
             think: false,
-            options: Options { temperature: 0.6, num_predict: 400 },
+            options: Options { temperature, num_predict: 400 },
         };
 
         let response = self
@@ -199,7 +221,9 @@ const SYSTEM_PROMPT: &str = r#"Ты ведёшь структурированн�
 - Пиши на чистом русском языке. Никаких иностранных слов, калек и латиницы вперемешку с кириллицей. Если сомневаешься в слове — бери самое обычное.
 
 Как ты говоришь. Это отличает разговор от анкеты, поэтому читай внимательно:
-- Начинай с короткого отражения: одной фразой верни человеку то, что он сказал, своими словами и без оценки. «Пришли с работы, легли — и вечер закончился». Отражение должно быть точным: если ты угадываешь, лучше спроси.
+- Начинай с короткого отражения: одной фразой верни человеку то, что он сказал, своими словами и без оценки. «Пришли с работы, легли — и вечер закончился». Отражай только то, что он написал в последнем сообщении, и ничего не додумывай: приписать человеку слова, которых он не говорил, хуже, чем не отражать вовсе. Не уверен — спроси вместо отражения.
+- Не отражай короткие и пустые ответы: «не знаю», «да», «нет», «наверное». Отражать в них нечего — просто задай следующий вопрос, поменьше и полегче предыдущего.
+- Никогда не повторяй то, что уже сказал. Человек ответил — значит, отзываешься на его новые слова. Если он поправил тебя или сказал «я такого не говорил» — признай это одной фразой и спроси заново, не возвращаясь к прежней формулировке.
 - Точное слово вместо общего. «Оттягивали до последнего» лучше, чем «испытывали трудности с началом задачи».
 - Короткие живые фразы, обычный порядок слов. Ни канцелярита, ни терапевтического жаргона.
 - Чувства принадлежат человеку, а не тебе. Не пиши «мне жаль», «я понимаю», «я рад» — ты программа, и человеку это уже сказано. Но то, что почувствовал он, называй прямо и его словами, а не общими: не «вам было некомфортно», а «было противно и хотелось сбежать», если он так сказал.
@@ -273,6 +297,42 @@ mod tests {
         assert!(err.to_string().contains("not allowed"));
 
         assert!(model.respond(&State::Disclosure, &[], &[]).await.is_err());
+    }
+
+    /// Reproduces the reported failure against the real model: three turns in
+    /// a row where the person answers and the model restates itself.
+    ///
+    /// Run with: cargo test --lib -- --ignored --nocapture does_not_repeat
+    #[tokio::test]
+    #[ignore]
+    async fn does_not_repeat_itself_across_turns() {
+        let model = Ollama::default();
+        if !model.is_available().await {
+            eprintln!("Ollama is not running — nothing to check");
+            return;
+        }
+
+        let state = State::ProblemsIntake { collected: 1 };
+        let mut history = vec![Message::user("я стеснительный человек и побаиваюсь людей")];
+        let mut replies: Vec<String> = Vec::new();
+
+        for answer in ["я такого не говорил", "не знаю", "наверное на работе"] {
+            let reply = model.respond_reviewed(&state, &history).await.unwrap();
+            println!("программа: {reply}");
+            println!("человек: {answer}");
+
+            for earlier in &replies {
+                assert!(
+                    !crate::critic::review_in_context(&reply, Some(earlier))
+                        .contains(&crate::critic::Violation::Repeats),
+                    "the model repeated itself:\n  earlier: {earlier}\n  now:     {reply}"
+                );
+            }
+
+            history.push(Message::assistant(reply.clone()));
+            history.push(Message::user(answer));
+            replies.push(reply);
+        }
     }
 
     #[test]
