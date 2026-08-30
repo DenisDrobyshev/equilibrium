@@ -199,6 +199,140 @@ impl Ollama {
     }
 }
 
+/// The chain the pattern step is trying to assemble, as the model read it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ExtractedSituation {
+    pub trigger: Option<String>,
+    pub feeling: Option<String>,
+    pub avoidance: Option<String>,
+    pub consequence: Option<String>,
+}
+
+impl Ollama {
+    /// Reads the chain out of what the person said: what came before, what
+    /// they felt, what they did instead, what followed.
+    ///
+    /// Extraction is a separate call from the conversation on purpose. Asking
+    /// one reply to both talk to a person and emit structured data makes it do
+    /// neither well, and this data has to be shown back for confirmation.
+    ///
+    /// Fields the person did not actually say come back empty. An invented
+    /// trigger would be confirmed by a tired user and then treated as fact.
+    pub async fn extract_situation(
+        &self,
+        history: &[Message],
+    ) -> Result<ExtractedSituation> {
+        let transcript = history
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if transcript.trim().is_empty() {
+            return Ok(ExtractedSituation::default());
+        }
+
+        let messages = vec![
+            Message::system(EXTRACTION_PROMPT.to_string()),
+            Message::user(transcript),
+        ];
+
+        let request = ExtractRequest {
+            model: &self.model,
+            messages: &messages,
+            stream: false,
+            think: false,
+            format: SITUATION_SCHEMA,
+            options: Options { temperature: 0.1, num_predict: 400 },
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/api/chat", self.base_url))
+            .json(&request)
+            .send()
+            .await
+            .context("could not reach the local model")?;
+
+        let parsed: ChatResponse = response.json().await.context("parsing model response")?;
+        let raw = strip_thinking(&parsed.message.content);
+        let extracted: ExtractedSituation =
+            serde_json::from_str(&raw).context("the model did not return the expected shape")?;
+
+        Ok(blank_out_empties(extracted))
+    }
+}
+
+/// Turns whitespace-only and placeholder answers into absent ones, so the UI
+/// shows a gap rather than a convincing blank.
+fn blank_out_empties(mut situation: ExtractedSituation) -> ExtractedSituation {
+    fn clean(value: &mut Option<String>) {
+        if let Some(text) = value {
+            let trimmed = text.trim();
+            if trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("null")
+                || trimmed == "-"
+                || trimmed == "не указано"
+                || trimmed == "неизвестно"
+            {
+                *value = None;
+            } else {
+                *value = Some(trimmed.to_string());
+            }
+        }
+    }
+    clean(&mut situation.trigger);
+    clean(&mut situation.feeling);
+    clean(&mut situation.avoidance);
+    clean(&mut situation.consequence);
+    situation
+}
+
+const EXTRACTION_PROMPT: &str = r#"Ты разбираешь то, что человек рассказал, на четыре части. Отвечай только объектом JSON, без пояснений.
+
+- trigger: что было перед этим, обстоятельство или событие
+- feeling: что человек почувствовал
+- avoidance: что он сделал вместо задуманного, чего избежал
+- consequence: к чему это привело
+
+Бери только то, что человек сказал сам, его словами и как можно короче. Ничего не додумывай и не обобщай. Если про какую-то часть он не говорил — оставь её пустой строкой. Пустое поле лучше выдуманного: человек увидит эту цепочку и подтвердит её, а подтверждённая выдумка станет считаться фактом."#;
+
+/// A schema, not just "json": free-form JSON mode returns a different shape
+/// every few calls.
+const SITUATION_SCHEMA: &str = r#"{
+  "type": "object",
+  "properties": {
+    "trigger": {"type": "string"},
+    "feeling": {"type": "string"},
+    "avoidance": {"type": "string"},
+    "consequence": {"type": "string"}
+  },
+  "required": ["trigger", "feeling", "avoidance", "consequence"]
+}"#;
+
+#[derive(Serialize)]
+struct ExtractRequest<'a> {
+    model: &'a str,
+    messages: &'a [Message],
+    stream: bool,
+    think: bool,
+    #[serde(with = "raw_json")]
+    format: &'a str,
+    options: Options,
+}
+
+/// Emits the schema string as JSON rather than as a quoted string.
+mod raw_json {
+    use serde::Serializer;
+
+    pub fn serialize<S: Serializer>(value: &&str, serializer: S) -> Result<S::Ok, S::Error> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(value).map_err(serde::ser::Error::custom)?;
+        serde::Serialize::serialize(&parsed, serializer)
+    }
+}
+
 /// Removes a reasoning block if one leaks through despite `think: false`.
 /// An unterminated block means the whole reply was deliberation, so nothing
 /// usable remains.
@@ -333,6 +467,55 @@ mod tests {
             history.push(Message::user(answer));
             replies.push(reply);
         }
+    }
+
+    /// Run with: cargo test --lib -- --ignored --nocapture extracts_the_chain
+    #[tokio::test]
+    #[ignore]
+    async fn extracts_the_chain_without_inventing_it() {
+        let model = Ollama::default();
+        if !model.is_available().await {
+            eprintln!("Ollama is not running — nothing to check");
+            return;
+        }
+
+        // A full account: every part is present in the person's own words.
+        let full = vec![Message::user(
+            "вчера на планёрке зашла речь о сроках, я хотел сказать что не успеваем, \
+             но внутри всё сжалось и я промолчал. потом весь день было противно от себя",
+        )];
+        let chain = model.extract_situation(&full).await.unwrap();
+        println!("полный рассказ -> {chain:?}");
+        assert!(chain.trigger.is_some(), "the trigger was in the account");
+        assert!(chain.avoidance.is_some(), "staying silent was the avoidance");
+
+        // A partial account: nothing was said about what followed, and the
+        // model must leave that empty rather than fill it in plausibly.
+        let partial = vec![Message::user("вчера не пошёл гулять, хотя собирался")];
+        let chain = model.extract_situation(&partial).await.unwrap();
+        println!("частичный рассказ -> {chain:?}");
+        assert!(
+            chain.feeling.is_none() && chain.consequence.is_none(),
+            "the model invented parts the person never mentioned: {chain:?}"
+        );
+
+        // Nothing at all in, nothing out.
+        let empty = model.extract_situation(&[]).await.unwrap();
+        assert!(empty.trigger.is_none());
+    }
+
+    #[test]
+    fn placeholder_answers_are_treated_as_absent() {
+        let cleaned = blank_out_empties(ExtractedSituation {
+            trigger: Some("  ".into()),
+            feeling: Some("не указано".into()),
+            avoidance: Some("null".into()),
+            consequence: Some("  промолчал  ".into()),
+        });
+        assert!(cleaned.trigger.is_none());
+        assert!(cleaned.feeling.is_none());
+        assert!(cleaned.avoidance.is_none());
+        assert_eq!(cleaned.consequence.as_deref(), Some("промолчал"));
     }
 
     #[test]

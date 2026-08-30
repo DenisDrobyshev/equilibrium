@@ -13,6 +13,14 @@ type View = {
   finished: boolean;
   missing: string[];
   problems: ProblemItem[];
+  situation: Situation | null;
+};
+type Situation = {
+  trigger: string;
+  feeling: string | null;
+  avoidance: string | null;
+  consequence: string | null;
+  ready: boolean;
 };
 type VaultStatus = {
   resumed: boolean;
@@ -270,6 +278,26 @@ export default function App() {
 
       {view.hint && <p className="hint">{view.hint}</p>}
 
+      {view.situation && (
+        <div className="chain">
+          <span className="chain-title">Как это выглядит по вашим словам</span>
+          <dl>
+            <dt>Перед этим</dt>
+            <dd>{view.situation.trigger || "—"}</dd>
+            <dt>Почувствовали</dt>
+            <dd>{view.situation.feeling || "—"}</dd>
+            <dt>Сделали вместо</dt>
+            <dd>{view.situation.avoidance || "—"}</dd>
+            <dt>Привело к</dt>
+            <dd>{view.situation.consequence || "—"}</dd>
+          </dl>
+          <p className="chain-note">
+            Прочерк — значит, вы про это не говорили. Ничего не сохранится, пока
+            вы не подтвердите.
+          </p>
+        </div>
+      )}
+
       {view.problems.length > 0 && view.state === "ProblemsIntake" && (
         <ol className="recorded">
           {view.problems.map((problem) => (
@@ -294,6 +322,7 @@ export default function App() {
         state={view.state}
         missing={view.missing}
         problems={view.problems}
+        situation={view.situation}
         busy={busy}
         hasInput={input.trim().length > 0}
         advance={advance}
@@ -326,6 +355,7 @@ function StepControls({
   state,
   missing,
   problems,
+  situation,
   busy,
   hasInput,
   advance,
@@ -336,6 +366,7 @@ function StepControls({
   state: string;
   missing: string[];
   problems: ProblemItem[];
+  situation: Situation | null;
   busy: boolean;
   hasInput: boolean;
   advance: (event: string, payload?: unknown) => void;
@@ -438,7 +469,14 @@ function StepControls({
     case "Pattern":
       return (
         <div className="controls">
-          {button("Всё верно, дальше", "situation_confirmed")}
+          <button
+            onClick={() => advance("situation_confirmed")}
+            disabled={busy || !situation?.ready}
+          >
+            {situation?.ready
+              ? "Всё верно, дальше"
+              : "Расскажите, что было перед этим"}
+          </button>
         </div>
       );
     case "SelectAction":

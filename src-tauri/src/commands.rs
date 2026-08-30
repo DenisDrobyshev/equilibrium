@@ -13,7 +13,9 @@ use tauri::{Manager, State as TauriState};
 use crate::clock::SystemClock;
 use crate::db::Store;
 use crate::model::{Message, Ollama};
-use crate::protocol::{ActionCheck, ActionOutcome, Event, Focus, PlanDraft, State};
+use crate::protocol::{
+    ActionCheck, ActionOutcome, Event, Focus, PlanDraft, SituationDraft, State,
+};
 use crate::safety::{self, RuleBasedDetector};
 use crate::session::{Branch, Practice, Turn};
 
@@ -46,6 +48,19 @@ pub struct View {
     pub missing: Vec<String>,
     /// Difficulties recorded so far, in the person's own words.
     pub problems: Vec<ProblemView>,
+    /// The chain assembled so far in the pattern step, for the person to
+    /// check and correct before anything is stored.
+    pub situation: Option<SituationView>,
+}
+
+#[derive(Serialize)]
+pub struct SituationView {
+    pub trigger: String,
+    pub feeling: Option<String>,
+    pub avoidance: Option<String>,
+    pub consequence: Option<String>,
+    /// True once the chain has enough to be worth confirming.
+    pub ready: bool,
 }
 
 #[derive(Serialize)]
@@ -179,9 +194,47 @@ pub async fn send_message(
         Turn::Crisis { .. } | Turn::Ended { .. } => view(&state),
         Turn::Continue { .. } => {
             generate_reply(&state).await?;
+            extract_situation_if_relevant(&state).await?;
             view(&state)
         }
     }
+}
+
+/// In the pattern step, reads the chain out of the conversation so the person
+/// can see and correct it. Nothing is stored until they confirm.
+///
+/// A failure here is not fatal: the practice continues with whatever the chain
+/// already had, because losing an extraction is better than losing the turn.
+async fn extract_situation_if_relevant(state: &TauriState<'_, AppState>) -> CmdResult<()> {
+    let history = {
+        let guard = state.practice.lock().unwrap();
+        let practice = guard.as_ref().ok_or("no practice is open")?;
+        if !matches!(practice.state(), State::Pattern { .. }) {
+            return Ok(());
+        }
+        practice
+            .transcript()
+            .map_err(err)?
+            .into_iter()
+            .map(|(role, content)| Message { role, content })
+            .collect::<Vec<_>>()
+    };
+
+    let Ok(extracted) = state.model.extract_situation(&history).await else {
+        return Ok(());
+    };
+
+    let situation = SituationDraft {
+        trigger: extracted.trigger.unwrap_or_default(),
+        feeling: extracted.feeling,
+        avoidance: extracted.avoidance,
+        consequence: extracted.consequence,
+    };
+
+    let mut guard = state.practice.lock().unwrap();
+    let practice = guard.as_mut().ok_or("no practice is open")?;
+    let _ = practice.apply(Event::SituationDrafted { situation });
+    Ok(())
 }
 
 /// Stores a difficulty the person wrote, then advances the step.
@@ -348,6 +401,16 @@ fn view(state: &TauriState<'_, AppState>) -> CmdResult<View> {
             .into_iter()
             .map(|(id, text)| ProblemView { id, text })
             .collect(),
+        situation: match protocol_state {
+            State::Pattern { situation } => Some(SituationView {
+                trigger: situation.trigger.clone(),
+                feeling: situation.feeling.clone(),
+                avoidance: situation.avoidance.clone(),
+                consequence: situation.consequence.clone(),
+                ready: !situation.trigger.trim().is_empty(),
+            }),
+            _ => None,
+        },
     })
 }
 

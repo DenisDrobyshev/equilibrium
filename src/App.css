@@ -167,6 +167,43 @@ button.small {
   color: var(--muted);
 }
 
+.chain {
+  margin: 0 0 1rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.chain-title {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.chain dl {
+  display: grid;
+  grid-template-columns: 11rem 1fr;
+  gap: 0.35rem 1rem;
+  margin: 0.75rem 0 0;
+}
+
+.chain dt {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.chain dd {
+  margin: 0;
+}
+
+.chain-note {
+  margin: 0.75rem 0 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
 .recorded {
   margin: 0 0 1rem;
   padding-left: 1.4rem;
