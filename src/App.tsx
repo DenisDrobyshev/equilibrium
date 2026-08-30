@@ -11,6 +11,7 @@ type View = {
   crisis: { resources: Resource[] } | null;
   finished: boolean;
   missing: string[];
+  problems: string[];
 };
 type VaultStatus = {
   resumed: boolean;
@@ -82,6 +83,14 @@ export default function App() {
     if (!text) return;
     setInput("");
     const result = await run(() => invoke<View>("send_message", { text }));
+    if (result) setView(result);
+  }
+
+  async function recordProblem() {
+    const text = input.trim();
+    if (!text) return;
+    setInput("");
+    const result = await run(() => invoke<View>("record_problem", { text }));
     if (result) setView(result);
   }
 
@@ -247,6 +256,14 @@ export default function App() {
 
       {view.hint && <p className="hint">{view.hint}</p>}
 
+      {view.problems.length > 0 && (
+        <ol className="recorded">
+          {view.problems.map((problem, i) => (
+            <li key={i}>{problem}</li>
+          ))}
+        </ol>
+      )}
+
       <div className="transcript">
         {view.transcript
           .filter((line) => line.content.trim().length > 0)
@@ -262,8 +279,11 @@ export default function App() {
       <StepControls
         state={view.state}
         missing={view.missing}
+        problems={view.problems}
         busy={busy}
+        hasInput={input.trim().length > 0}
         advance={advance}
+        recordProblem={recordProblem}
       />
 
       <div className="composer">
@@ -289,13 +309,19 @@ export default function App() {
 function StepControls({
   state,
   missing,
+  problems,
   busy,
+  hasInput,
   advance,
+  recordProblem,
 }: {
   state: string;
   missing: string[];
+  problems: string[];
   busy: boolean;
+  hasInput: boolean;
   advance: (event: string, payload?: unknown) => void;
+  recordProblem: () => void;
 }) {
   const [plan, setPlan] = useState({
     description: "",
@@ -313,8 +339,17 @@ function StepControls({
     case "ProblemsIntake":
       return (
         <div className="controls">
-          {button("Записать как трудность", "problem_added")}
-          {button("Дальше", "problems_finished")}
+          <button onClick={recordProblem} disabled={busy || !hasInput}>
+            Записать как трудность
+          </button>
+          <button
+            onClick={() => advance("problems_finished")}
+            disabled={busy || problems.length < 2}
+          >
+            {problems.length < 2
+              ? `Дальше (нужно ещё ${2 - problems.length})`
+              : "Дальше"}
+          </button>
         </div>
       );
     case "GoalIntake":

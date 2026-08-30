@@ -44,6 +44,8 @@ pub struct View {
     pub finished: bool,
     /// What the step still needs before the practice can move on.
     pub missing: Vec<String>,
+    /// Difficulties recorded so far, in the person's own words.
+    pub problems: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -176,6 +178,25 @@ pub async fn send_message(
     }
 }
 
+/// Stores a difficulty the person wrote, then advances the step.
+///
+/// Kept separate from `advance` because the wording itself is the point: it is
+/// what every later measurement compares against.
+#[tauri::command]
+pub async fn record_problem(
+    state: TauriState<'_, AppState>,
+    text: String,
+) -> CmdResult<View> {
+    {
+        let mut guard = state.practice.lock().unwrap();
+        let practice = guard.as_mut().ok_or("no practice is open")?;
+        practice.record_problem(&text).map_err(err)?;
+        practice.apply(Event::ProblemAdded).map_err(err)?;
+    }
+    generate_reply(&state).await?;
+    view(&state)
+}
+
 /// Applies a protocol event the UI raised (a button, not free text).
 #[tauri::command]
 pub async fn advance(
@@ -270,6 +291,7 @@ fn view(state: &TauriState<'_, AppState>) -> CmdResult<View> {
         crisis,
         finished: protocol_state.is_terminal(),
         missing,
+        problems: practice.problems().unwrap_or_default(),
     })
 }
 

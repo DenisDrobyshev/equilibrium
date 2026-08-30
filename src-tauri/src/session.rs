@@ -286,6 +286,46 @@ impl Practice {
         self.store.save()
     }
 
+    /// Stores a difficulty in the person's own words.
+    ///
+    /// This wording is the unit of measurement for everything that follows, so
+    /// it is stored verbatim and never rewritten by the model.
+    pub fn record_problem(&mut self, formulation: &str) -> Result<()> {
+        let formulation = formulation.trim();
+        if formulation.is_empty() {
+            bail!("a difficulty cannot be empty");
+        }
+
+        let now = self.clock.now();
+        let next_order: i64 = self
+            .store
+            .connection()
+            .query_row(
+                "SELECT coalesce(max(sort_order), -1) + 1 FROM problems",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        self.store.connection().execute(
+            "INSERT INTO problems (formulation, created_at, sort_order) VALUES (?1, ?2, ?3)",
+            params![formulation, now.to_rfc3339(), next_order],
+        )?;
+        self.store.save()
+    }
+
+    /// Difficulties recorded so far, in the order they were added.
+    pub fn problems(&self) -> Result<Vec<String>> {
+        let conn = self.store.connection();
+        let mut stmt = conn.prepare(
+            "SELECT formulation FROM problems WHERE retired_at IS NULL ORDER BY sort_order, id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// The conversation so far, oldest first, as (role, content).
     pub fn transcript(&self) -> Result<Vec<(String, String)>> {
         let conn = self.store.connection();
@@ -587,6 +627,61 @@ mod tests {
         println!("результат: {turn:?}");
         assert!(matches!(turn, Turn::Crisis { .. }));
         println!("===== конец =====\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Walks onboarding the way a person does and checks the data landed.
+    ///
+    /// Written after shipping a build where "record as a difficulty" advanced
+    /// the step without storing anything: the state machine was right, the
+    /// table was empty, and every existing test passed. Asserting on state
+    /// transitions is not the same as asserting the product did its job.
+    #[test]
+    fn onboarding_actually_stores_what_the_person_wrote() {
+        let dir = temp_dir("onboarding-data");
+        let clock = Arc::new(TestClock::at("2026-08-30T10:00:00Z"));
+        let mut p = practice(&dir, clock, Branch::Onboarding);
+
+        p.apply(Event::DisclosureAccepted { adult: true }).unwrap();
+
+        let first = "по вечерам не могу заставить себя выйти из дома";
+        let second = "стесняюсь и побаиваюсь людей";
+
+        p.record_problem(first).unwrap();
+        p.apply(Event::ProblemAdded).unwrap();
+        p.record_problem(second).unwrap();
+        p.apply(Event::ProblemAdded).unwrap();
+
+        // The wording is the unit of measurement: it must be stored verbatim.
+        let stored = p.problems().unwrap();
+        assert_eq!(stored, vec![first.to_string(), second.to_string()]);
+
+        // And it must survive a restart, not just live in memory.
+        drop(p);
+        let store = Store::open(&dir, "passphrase").unwrap();
+        let reopened = Practice::resume(
+            store,
+            Box::new(SharedClock(Arc::new(TestClock::at("2026-08-30T11:00:00Z")))),
+            Box::new(RuleBasedDetector),
+        )
+        .unwrap();
+        match reopened {
+            Ok(p) => assert_eq!(p.problems().unwrap().len(), 2),
+            Err(_) => panic!("the unfinished onboarding should resume"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_difficulty_is_refused() {
+        let dir = temp_dir("empty-problem");
+        let clock = Arc::new(TestClock::at("2026-08-30T10:00:00Z"));
+        let mut p = practice(&dir, clock, Branch::Onboarding);
+
+        assert!(p.record_problem("   ").is_err());
+        assert!(p.problems().unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -23,6 +23,7 @@ pub fn run() {
             commands::open_vault,
             commands::begin_practice,
             commands::send_message,
+            commands::record_problem,
             commands::advance,
         ])
         .run(tauri::generate_context!())

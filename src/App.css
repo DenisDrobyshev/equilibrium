@@ -167,6 +167,17 @@ button.small {
   color: var(--muted);
 }
 
+.recorded {
+  margin: 0 0 1rem;
+  padding-left: 1.4rem;
+  color: var(--ink);
+  font-size: 0.95rem;
+}
+
+.recorded li {
+  margin-bottom: 0.3rem;
+}
+
 .hint {
   margin: 0 0 1rem;
   padding: 0.7rem 0.9rem;
