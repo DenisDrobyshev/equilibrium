@@ -6,6 +6,7 @@ type Line = { role: string; content: string };
 type Resource = { name: string; contact: string };
 type View = {
   state: string;
+  hint: string;
   transcript: Line[];
   crisis: { resources: Resource[] } | null;
   finished: boolean;
@@ -244,13 +245,17 @@ export default function App() {
         </button>
       </header>
 
+      {view.hint && <p className="hint">{view.hint}</p>}
+
       <div className="transcript">
-        {view.transcript.map((line, i) => (
-          <div key={i} className={`line ${line.role}`}>
-            {line.content}
-          </div>
-        ))}
-        {busy && <div className="line assistant pending">…</div>}
+        {view.transcript
+          .filter((line) => line.content.trim().length > 0)
+          .map((line, i) => (
+            <div key={i} className={`line ${line.role}`}>
+              {line.content}
+            </div>
+          ))}
+        {busy && <div className="line assistant pending">Думает…</div>}
         <div ref={bottom} />
       </div>
 

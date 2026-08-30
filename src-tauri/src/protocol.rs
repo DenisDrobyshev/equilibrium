@@ -253,6 +253,42 @@ impl State {
         )
     }
 
+    /// What the person is being asked to do, in the interface itself.
+    ///
+    /// Shown regardless of what the model produced. A step whose meaning
+    /// depends on the model having spoken is a step that breaks the moment the
+    /// model returns nothing — which is exactly what happened on first use.
+    pub fn hint(&self) -> &'static str {
+        match self {
+            State::ProblemsIntake { collected } => {
+                if *collected == 0 {
+                    "Опишите своими словами, с чем хотите работать: что происходит и когда. Потом нажмите «Записать как трудность». Нужно от двух до четырёх."
+                } else {
+                    "Опишите следующую трудность или нажмите «Дальше», если хватит."
+                }
+            }
+            State::GoalIntake => {
+                "Назовите одну цель — действие, которое можно сделать и про которое понятно, сделано оно или нет."
+            }
+            State::Baseline => "Оцените каждую трудность от 0 до 10 на сегодня.",
+            State::Psychoeducation => "Прочитайте и нажмите «Понятно».",
+            State::Opening => "Напишите, что вышло с тем, что вы наметили в прошлый раз.",
+            State::ReviewPlanned => "Выберите, что произошло с запланированным действием.",
+            State::Agenda => "Выберите, чем заняться сегодня.",
+            State::Pattern { .. } => {
+                "Отвечайте на вопросы о ситуации. Когда цепочка собрана — нажмите «Всё верно»."
+            }
+            State::SelectAction { .. } => {
+                "Напишите одно действие, которое сделаете до следующего раза."
+            }
+            State::ConcretePlan { .. } => "Заполните: что именно, когда и где.",
+            State::Close => "Нажмите «Завершить».",
+            State::Disclosure => "Прочитайте и подтвердите.",
+            State::Crisis { .. } => "",
+            State::Ended { .. } => "",
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             State::Disclosure => "Disclosure",

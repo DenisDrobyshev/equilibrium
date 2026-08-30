@@ -37,6 +37,8 @@ impl AppState {
 pub struct View {
     /// Name of the protocol state, for the UI to decide what controls to show.
     pub state: String,
+    /// What to do on this step. Shown whether or not the model said anything.
+    pub hint: String,
     pub transcript: Vec<Line>,
     pub crisis: Option<CrisisView>,
     pub finished: bool,
@@ -263,6 +265,7 @@ fn view(state: &TauriState<'_, AppState>) -> CmdResult<View> {
 
     Ok(View {
         state: protocol_state.name().to_string(),
+        hint: protocol_state.hint().to_string(),
         transcript,
         crisis,
         finished: protocol_state.is_terminal(),

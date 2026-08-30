@@ -58,6 +58,10 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: &'a [Message],
     stream: bool,
+    /// qwen3 and other reasoning models spend the whole token budget inside a
+    /// hidden thinking block and emit nothing, which reaches the user as an
+    /// empty bubble. The step is small; it does not need deliberation.
+    think: bool,
     options: Options,
 }
 
@@ -148,7 +152,8 @@ impl Ollama {
             model: &self.model,
             messages: &messages,
             stream: false,
-            options: Options { temperature: 0.6, num_predict: 220 },
+            think: false,
+            options: Options { temperature: 0.6, num_predict: 400 },
         };
 
         let response = self
@@ -164,8 +169,24 @@ impl Ollama {
         }
 
         let parsed: ChatResponse = response.json().await.context("parsing model response")?;
-        Ok(parsed.message.content.trim().to_string())
+        let text = strip_thinking(&parsed.message.content);
+        if text.is_empty() {
+            bail!("the model returned nothing usable");
+        }
+        Ok(text)
     }
+}
+
+/// Removes a reasoning block if one leaks through despite `think: false`.
+/// An unterminated block means the whole reply was deliberation, so nothing
+/// usable remains.
+fn strip_thinking(raw: &str) -> String {
+    let text = match raw.split_once("</think>") {
+        Some((_, after)) => after,
+        None if raw.contains("<think>") => "",
+        None => raw,
+    };
+    text.trim().to_string()
 }
 
 /// The standing instructions. Every line here answers a specific finding from
