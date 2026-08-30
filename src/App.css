@@ -227,8 +227,23 @@ button.small {
   border-top: 1px solid var(--line);
 }
 
-.controls.plan {
+.controls.plan,
+.controls.ratings {
   flex-direction: column;
+}
+
+.controls.ratings label {
+  display: grid;
+  grid-template-columns: 1fr 160px 2ch;
+  align-items: center;
+  gap: 0.75rem;
+  font-size: 0.95rem;
+}
+
+.controls.ratings output {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  text-align: right;
 }
 
 .missing {

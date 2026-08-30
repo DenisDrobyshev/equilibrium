@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
 type Line = { role: string; content: string };
+type ProblemItem = { id: number; text: string };
 type Resource = { name: string; contact: string };
 type View = {
   state: string;
@@ -11,7 +12,7 @@ type View = {
   crisis: { resources: Resource[] } | null;
   finished: boolean;
   missing: string[];
-  problems: string[];
+  problems: ProblemItem[];
 };
 type VaultStatus = {
   resumed: boolean;
@@ -91,6 +92,19 @@ export default function App() {
     if (!text) return;
     setInput("");
     const result = await run(() => invoke<View>("record_problem", { text }));
+    if (result) setView(result);
+  }
+
+  async function recordGoal() {
+    const text = input.trim();
+    if (!text) return;
+    setInput("");
+    const result = await run(() => invoke<View>("record_goal", { text }));
+    if (result) setView(result);
+  }
+
+  async function recordRatings(ratings: [number, number][]) {
+    const result = await run(() => invoke<View>("record_ratings", { ratings }));
     if (result) setView(result);
   }
 
@@ -256,10 +270,10 @@ export default function App() {
 
       {view.hint && <p className="hint">{view.hint}</p>}
 
-      {view.problems.length > 0 && (
+      {view.problems.length > 0 && view.state === "ProblemsIntake" && (
         <ol className="recorded">
-          {view.problems.map((problem, i) => (
-            <li key={i}>{problem}</li>
+          {view.problems.map((problem) => (
+            <li key={problem.id}>{problem.text}</li>
           ))}
         </ol>
       )}
@@ -284,6 +298,8 @@ export default function App() {
         hasInput={input.trim().length > 0}
         advance={advance}
         recordProblem={recordProblem}
+        recordGoal={recordGoal}
+        recordRatings={recordRatings}
       />
 
       <div className="composer">
@@ -314,20 +330,25 @@ function StepControls({
   hasInput,
   advance,
   recordProblem,
+  recordGoal,
+  recordRatings,
 }: {
   state: string;
   missing: string[];
-  problems: string[];
+  problems: ProblemItem[];
   busy: boolean;
   hasInput: boolean;
   advance: (event: string, payload?: unknown) => void;
   recordProblem: () => void;
+  recordGoal: () => void;
+  recordRatings: (ratings: [number, number][]) => void;
 }) {
   const [plan, setPlan] = useState({
     description: "",
     scheduled_at: "",
     place: "",
   });
+  const [ratings, setRatings] = useState<Record<number, number>>({});
 
   const button = (label: string, event: string, payload?: unknown) => (
     <button key={event} onClick={() => advance(event, payload)} disabled={busy}>
@@ -353,11 +374,41 @@ function StepControls({
         </div>
       );
     case "GoalIntake":
-      return <div className="controls">{button("Цель записана", "goal_set")}</div>;
-    case "Baseline":
       return (
         <div className="controls">
-          {button("Отметка сделана", "baseline_recorded")}
+          <button onClick={recordGoal} disabled={busy || !hasInput}>
+            Записать цель
+          </button>
+        </div>
+      );
+    case "Baseline":
+      return (
+        <div className="controls ratings">
+          {problems.map((problem) => (
+            <label key={problem.id}>
+              <span>{problem.text}</span>
+              <input
+                type="range"
+                min={0}
+                max={10}
+                value={ratings[problem.id] ?? 5}
+                onChange={(e) =>
+                  setRatings({ ...ratings, [problem.id]: Number(e.target.value) })
+                }
+              />
+              <output>{ratings[problem.id] ?? 5}</output>
+            </label>
+          ))}
+          <button
+            onClick={() =>
+              recordRatings(
+                problems.map((p) => [p.id, ratings[p.id] ?? 5] as [number, number]),
+              )
+            }
+            disabled={busy || problems.length === 0}
+          >
+            Записать отметку
+          </button>
         </div>
       );
     case "Psychoeducation":

@@ -45,7 +45,13 @@ pub struct View {
     /// What the step still needs before the practice can move on.
     pub missing: Vec<String>,
     /// Difficulties recorded so far, in the person's own words.
-    pub problems: Vec<String>,
+    pub problems: Vec<ProblemView>,
+}
+
+#[derive(Serialize)]
+pub struct ProblemView {
+    pub id: i64,
+    pub text: String,
 }
 
 #[derive(Serialize)]
@@ -197,6 +203,35 @@ pub async fn record_problem(
     view(&state)
 }
 
+/// Stores the goal, then advances the step.
+#[tauri::command]
+pub async fn record_goal(state: TauriState<'_, AppState>, text: String) -> CmdResult<View> {
+    {
+        let mut guard = state.practice.lock().unwrap();
+        let practice = guard.as_mut().ok_or("no practice is open")?;
+        practice.record_goal(&text).map_err(err)?;
+        practice.apply(Event::GoalSet).map_err(err)?;
+    }
+    generate_reply(&state).await?;
+    view(&state)
+}
+
+/// Stores one rating per difficulty, then advances the step.
+#[tauri::command]
+pub async fn record_ratings(
+    state: TauriState<'_, AppState>,
+    ratings: Vec<(i64, i64)>,
+) -> CmdResult<View> {
+    {
+        let mut guard = state.practice.lock().unwrap();
+        let practice = guard.as_mut().ok_or("no practice is open")?;
+        practice.record_ratings(&ratings).map_err(err)?;
+        practice.apply(Event::BaselineRecorded).map_err(err)?;
+    }
+    generate_reply(&state).await?;
+    view(&state)
+}
+
 /// Applies a protocol event the UI raised (a button, not free text).
 #[tauri::command]
 pub async fn advance(
@@ -209,6 +244,22 @@ pub async fn advance(
     let allows_generation = {
         let mut guard = state.practice.lock().unwrap();
         let practice = guard.as_mut().ok_or("no practice is open")?;
+
+        // Steps that carry data persist it before the state moves on;
+        // otherwise the practice advances and the tables stay empty.
+        match &event {
+            Event::SituationConfirmed => {
+                if let State::Pattern { situation } = practice.state() {
+                    let situation = situation.clone();
+                    practice.record_situation(&situation).map_err(err)?;
+                }
+            }
+            Event::PlanUpdated { draft } if draft.is_complete() => {
+                practice.record_plan(draft).map_err(err)?;
+            }
+            _ => {}
+        }
+
         let next = practice.apply(event).map_err(err)?;
         next.allows_generation() && !next.is_terminal()
     };
@@ -291,7 +342,12 @@ fn view(state: &TauriState<'_, AppState>) -> CmdResult<View> {
         crisis,
         finished: protocol_state.is_terminal(),
         missing,
-        problems: practice.problems().unwrap_or_default(),
+        problems: practice
+            .problems_with_ids()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, text)| ProblemView { id, text })
+            .collect(),
     })
 }
 

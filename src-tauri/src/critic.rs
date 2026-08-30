@@ -32,6 +32,11 @@ pub enum Violation {
     GivesAdvice,
     /// Claims to feel or understand. It is a program and has said so.
     ClaimsFeelings,
+    /// Metaphor, uplift, therapeutic grandeur. The register of a poster, not
+    /// of an experienced practitioner.
+    Pompous,
+    /// Officialese. Makes the reply read as a form rather than a conversation.
+    Bureaucratic,
     /// Longer than a step warrants.
     TooLong,
     /// More than one question at a time.
@@ -52,7 +57,13 @@ impl Violation {
                 "Ты дал совет. Это не твоя работа: шаг ведёт программа, а человек сам выбирает действие."
             }
             Violation::ClaimsFeelings => {
-                "Ты написал так, будто чувствуешь или понимаешь по-человечески. Не изображай чувства."
+                "Ты приписал чувства себе. Чувства принадлежат человеку: назови его словами то, что почувствовал он, и убери всё про себя."
+            }
+            Violation::Pompous => {
+                "Ты ушёл в образы и торжественность. Убери метафоры про путь, рост и работу над собой, скажи то же самое обычными словами."
+            }
+            Violation::Bureaucratic => {
+                "Это канцелярит. Скажи как в разговоре: короче и обычными словами."
             }
             Violation::TooLong => "Слишком длинно. Две-четыре фразы.",
             Violation::MultipleQuestions => "Задай ровно один вопрос.",
@@ -99,6 +110,35 @@ const OPTIONS: &[&str] = &["например", "к примеру", "вот не
 
 const FEELINGS: &[&str] = &["мне жаль", "я чувствую", "мне приятно", "я рад", "сочувствую"];
 
+/// Poster language. An experienced practitioner does not talk like this, and
+/// in a program it reads as a stock phrase rather than attention.
+const POMPOUS: &[&str] = &[
+    "путь к себе",
+    "ваш путь",
+    "путешествие",
+    "личностный рост",
+    "работа над собой",
+    "внутренняя сила",
+    "внутренний ребенок",
+    "принять себя",
+    "полюбить себя",
+    "исцелен",
+    "гармони",
+    "обрести",
+    "свет в конце",
+    "маленькие шаги ведут",
+];
+
+const BUREAUCRATIC: &[&str] = &[
+    "осуществля",
+    "в рамках данн",
+    "на данный момент времени",
+    "в связи с вышеизложенн",
+    "следует отметить",
+    "необходимо понимать",
+    "с целью улучшения",
+];
+
 /// Maximum sentences in a reply. The protocol moves in small steps.
 const MAX_SENTENCES: usize = 5;
 const MAX_CHARS: usize = 700;
@@ -118,6 +158,12 @@ pub fn review(text: &str) -> Vec<Violation> {
     }
     if FEELINGS.iter().any(|p| lower.contains(p)) {
         found.push(Violation::ClaimsFeelings);
+    }
+    if POMPOUS.iter().any(|p| lower.contains(p)) {
+        found.push(Violation::Pompous);
+    }
+    if BUREAUCRATIC.iter().any(|p| lower.contains(p)) {
+        found.push(Violation::Bureaucratic);
     }
     if text.chars().count() > MAX_CHARS || count_sentences(text) > MAX_SENTENCES {
         found.push(Violation::TooLong);
@@ -227,6 +273,36 @@ mod tests {
     #[test]
     fn catches_performed_feelings() {
         assert!(review("Мне жаль, что так вышло.").contains(&Violation::ClaimsFeelings));
+    }
+
+    #[test]
+    fn catches_poster_language_and_officialese() {
+        assert!(review("Это ваш путь к себе.").contains(&Violation::Pompous));
+        assert!(
+            review("Главное — принять себя таким, какой вы есть.").contains(&Violation::Pompous)
+        );
+        assert!(
+            review("В рамках данного этапа необходимо понимать динамику.")
+                .contains(&Violation::Bureaucratic)
+        );
+    }
+
+    /// Reflection is what makes the reply sound like a person rather than a
+    /// form, so the review must not stand in its way.
+    #[test]
+    fn lets_a_plain_reflection_through() {
+        let reflections = [
+            "Пришли с работы, легли — и вечер закончился. Что было в голове в тот момент?",
+            "Значит, вы оттягивали до последнего, а потом стало поздно. Что мешало начать раньше?",
+            "Вы говорите про стеснение, а описываете, как молчали весь вечер. Так было и в этот раз?",
+        ];
+        for reply in reflections {
+            assert!(
+                review(reply).is_empty(),
+                "review rejected a plain reflection {reply:?}: {:?}",
+                review(reply)
+            );
+        }
     }
 
     #[test]

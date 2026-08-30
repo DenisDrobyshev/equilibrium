@@ -24,6 +24,8 @@ pub fn run() {
             commands::begin_practice,
             commands::send_message,
             commands::record_problem,
+            commands::record_goal,
+            commands::record_ratings,
             commands::advance,
         ])
         .run(tauri::generate_context!())

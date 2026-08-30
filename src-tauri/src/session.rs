@@ -18,7 +18,7 @@ use rusqlite::params;
 use crate::clock::Clock;
 use crate::db::Store;
 use crate::disclosure::{self, Disclosure, History};
-use crate::protocol::{EndReason, Event, RiskKind, State};
+use crate::protocol::{EndReason, Event, PlanDraft, RiskKind, SituationDraft, State};
 use crate::safety::{Assessment, RiskDetector};
 
 /// Hard cap on a single practice. Not a nudge — the machine ends the session.
@@ -312,6 +312,98 @@ impl Practice {
             params![formulation, now.to_rfc3339(), next_order],
         )?;
         self.store.save()
+    }
+
+    /// Stores the goal, in the person's own words.
+    pub fn record_goal(&mut self, formulation: &str) -> Result<()> {
+        let formulation = formulation.trim();
+        if formulation.is_empty() {
+            bail!("a goal cannot be empty");
+        }
+        let now = self.clock.now();
+        self.store.connection().execute(
+            "INSERT INTO goals (formulation, created_at) VALUES (?1, ?2)",
+            params![formulation, now.to_rfc3339()],
+        )?;
+        self.store.save()
+    }
+
+    /// Stores one rating per difficulty. These single items are the measure of
+    /// change — there are no clinical scales here by design.
+    pub fn record_ratings(&mut self, ratings: &[(i64, i64)]) -> Result<()> {
+        if ratings.is_empty() {
+            bail!("nothing to record");
+        }
+        let now = self.clock.now().to_rfc3339();
+        for (problem_id, value) in ratings {
+            if !(0..=10).contains(value) {
+                bail!("a rating must be between 0 and 10, got {value}");
+            }
+            self.store.connection().execute(
+                "INSERT INTO problem_ratings (problem_id, value, rated_at) VALUES (?1, ?2, ?3)",
+                params![problem_id, value, now],
+            )?;
+        }
+        self.store.save()
+    }
+
+    /// Stores a situation once the person has confirmed the chain is right.
+    pub fn record_situation(&mut self, situation: &SituationDraft) -> Result<()> {
+        let now = self.clock.now();
+        self.store.connection().execute(
+            "INSERT INTO situations
+             (session_id, trigger, feeling, avoidance, consequence, recorded_at, confirmed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+            params![
+                self.session_id,
+                situation.trigger,
+                situation.feeling,
+                situation.avoidance,
+                situation.consequence,
+                now.to_rfc3339(),
+            ],
+        )?;
+        self.store.save()
+    }
+
+    /// Stores the planned action. Refuses an incomplete plan: "when" and
+    /// "where" are what make the action happen.
+    pub fn record_plan(&mut self, plan: &PlanDraft) -> Result<()> {
+        let missing = plan.missing();
+        if !missing.is_empty() {
+            bail!("the plan is missing: {}", missing.join(", "));
+        }
+        let now = self.clock.now();
+        self.store.connection().execute(
+            "INSERT INTO planned_actions
+             (session_id, description, scheduled_at, place, duration_min,
+              obstacle, plan_b, stimulus_prep, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                self.session_id,
+                plan.description,
+                plan.scheduled_at,
+                plan.place,
+                plan.duration_min,
+                plan.obstacle,
+                plan.plan_b,
+                plan.stimulus_prep,
+                now.to_rfc3339(),
+            ],
+        )?;
+        self.store.save()
+    }
+
+    /// Difficulties with their ids, for recording ratings against them.
+    pub fn problems_with_ids(&self) -> Result<Vec<(i64, String)>> {
+        let conn = self.store.connection();
+        let mut stmt = conn.prepare(
+            "SELECT id, formulation FROM problems WHERE retired_at IS NULL ORDER BY sort_order, id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Difficulties recorded so far, in the order they were added.
@@ -670,6 +762,110 @@ mod tests {
             Ok(p) => assert_eq!(p.problems().unwrap().len(), 2),
             Err(_) => panic!("the unfinished onboarding should resume"),
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every step that carries data must leave a row behind.
+    ///
+    /// The first build advanced through all of these while writing nothing:
+    /// goal, ratings, situation and plan were all lost. One assertion per
+    /// table, so a step that silently stops persisting fails here.
+    #[test]
+    fn every_step_that_carries_data_writes_a_row() {
+        let dir = temp_dir("all-data");
+        let clock = Arc::new(TestClock::at("2026-08-30T10:00:00Z"));
+        let mut p = practice(&dir, clock, Branch::Onboarding);
+
+        p.apply(Event::DisclosureAccepted { adult: true }).unwrap();
+        p.record_problem("по вечерам не могу выйти из дома").unwrap();
+        p.apply(Event::ProblemAdded).unwrap();
+        p.record_problem("молчу на планёрках").unwrap();
+        p.apply(Event::ProblemAdded).unwrap();
+        p.apply(Event::ProblemsFinished).unwrap();
+
+        p.record_goal("сказать на планёрке про сроки").unwrap();
+        p.apply(Event::GoalSet).unwrap();
+
+        let ids: Vec<i64> = p.problems_with_ids().unwrap().into_iter().map(|(id, _)| id).collect();
+        p.record_ratings(&[(ids[0], 7), (ids[1], 4)]).unwrap();
+        p.apply(Event::BaselineRecorded).unwrap();
+
+        p.record_situation(&SituationDraft {
+            trigger: "планёрка, зашла речь о сроках".into(),
+            feeling: Some("сжалось внутри".into()),
+            avoidance: Some("промолчал".into()),
+            consequence: Some("весь день было противно".into()),
+        })
+        .unwrap();
+
+        p.record_plan(&PlanDraft {
+            description: "написать в чат про сроки".into(),
+            scheduled_at: Some("2026-08-31T10:00".into()),
+            place: Some("рабочий чат".into()),
+            duration_min: Some(5),
+            obstacle: Some("страшно, что переспросят".into()),
+            plan_b: Some("написать одному человеку".into()),
+            stimulus_prep: Some("заранее набросать текст".into()),
+        })
+        .unwrap();
+
+        let conn = p.store().connection();
+        let count = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+
+        assert_eq!(count("problems"), 2, "difficulties were not stored");
+        assert_eq!(count("goals"), 1, "the goal was not stored");
+        assert_eq!(count("problem_ratings"), 2, "the baseline was not stored");
+        assert_eq!(count("situations"), 1, "the situation was not stored");
+        assert_eq!(count("planned_actions"), 1, "the plan was not stored");
+
+        // The plan's required fields are what make the action happen.
+        let (when, place): (String, String) = conn
+            .query_row(
+                "SELECT scheduled_at, place FROM planned_actions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(when, "2026-08-31T10:00");
+        assert_eq!(place, "рабочий чат");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_incomplete_plan_is_refused() {
+        let dir = temp_dir("incomplete-plan");
+        let clock = Arc::new(TestClock::at("2026-08-30T10:00:00Z"));
+        let mut p = practice(&dir, clock, Branch::Regular);
+
+        let err = p
+            .record_plan(&PlanDraft {
+                description: "погулять".into(),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("scheduled_at"), "{err}");
+        assert!(err.contains("place"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rating_outside_the_scale_is_refused() {
+        let dir = temp_dir("bad-rating");
+        let clock = Arc::new(TestClock::at("2026-08-30T10:00:00Z"));
+        let mut p = practice(&dir, clock, Branch::Onboarding);
+        p.record_problem("что-то").unwrap();
+        let id = p.problems_with_ids().unwrap()[0].0;
+
+        assert!(p.record_ratings(&[(id, 11)]).is_err());
+        assert!(p.record_ratings(&[(id, -1)]).is_err());
+        assert!(p.record_ratings(&[(id, 10)]).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
