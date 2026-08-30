@@ -1,0 +1,605 @@
+//! The practice runtime: the one place where the protocol, the risk guard and
+//! the store meet.
+//!
+//! Everything a user says passes through `submit_user_message`, and that
+//! method runs the guard before anything else can happen. There is no other
+//! way in. That is the point — a caller cannot accidentally reach the model
+//! without the guard having run, because the caller never holds the model and
+//! the state at the same time.
+//!
+//! The runtime also owns persistence: every accepted transition is written and
+//! the vault is saved immediately. Losing a practice to a crash would mean
+//! asking someone to tell a difficult story twice.
+
+use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Duration, Utc};
+use rusqlite::params;
+
+use crate::clock::Clock;
+use crate::db::Store;
+use crate::disclosure::{self, Disclosure, History};
+use crate::protocol::{EndReason, Event, RiskKind, State};
+use crate::safety::{Assessment, RiskDetector};
+
+/// Hard cap on a single practice. Not a nudge — the machine ends the session.
+///
+/// This exists because engagement is the wrong objective here: longer daily
+/// use is associated with more loneliness and dependence, not less (Fang et
+/// al., MIT Media Lab / OpenAI RCT, n ≈ 981).
+const MAX_PRACTICE_MINUTES: i64 = 60;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Turn {
+    /// The guard is clear and the practice continues. Generation is allowed
+    /// only if `state.allows_generation()`.
+    Continue { state: State },
+    /// The guard fired. Show static crisis content; do not generate.
+    Crisis { kind: RiskKind },
+    /// The practice is over.
+    Ended { reason: EndReason },
+}
+
+pub struct Practice {
+    store: Store,
+    clock: Box<dyn Clock>,
+    detector: Box<dyn RiskDetector + Send + Sync>,
+    session_id: i64,
+    started_at: DateTime<Utc>,
+    state: State,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Branch {
+    Onboarding,
+    Regular,
+}
+
+impl Branch {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Branch::Onboarding => "onboarding",
+            Branch::Regular => "regular",
+        }
+    }
+
+    fn initial_state(&self) -> State {
+        match self {
+            Branch::Onboarding => State::start_onboarding(),
+            Branch::Regular => State::start_practice(),
+        }
+    }
+}
+
+impl Practice {
+    pub fn begin(
+        store: Store,
+        clock: Box<dyn Clock>,
+        detector: Box<dyn RiskDetector + Send + Sync>,
+        branch: Branch,
+    ) -> Result<Self> {
+        let now = clock.now();
+        let state = branch.initial_state();
+
+        store.connection().execute(
+            "INSERT INTO practice_sessions (branch, started_at, current_state, states)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                branch.as_str(),
+                now.to_rfc3339(),
+                serde_json::to_string(&state)?,
+                serde_json::to_string(&vec![state.name()])?,
+            ],
+        )?;
+        let session_id = store.connection().last_insert_rowid();
+
+        let practice = Practice {
+            store,
+            clock,
+            detector,
+            session_id,
+            started_at: now,
+            state,
+        };
+        practice.store.save()?;
+        Ok(practice)
+    }
+
+    /// Picks up an unfinished practice, if there is one.
+    pub fn resume(
+        store: Store,
+        clock: Box<dyn Clock>,
+        detector: Box<dyn RiskDetector + Send + Sync>,
+    ) -> Result<std::result::Result<Self, Store>> {
+        let row = store
+            .connection()
+            .query_row(
+                "SELECT id, started_at, current_state FROM practice_sessions
+                 WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .ok();
+
+        let Some((session_id, started_at, current_state)) = row else {
+            // Nothing to resume — hand the store back so the caller can begin.
+            return Ok(Err(store));
+        };
+
+        let started_at = DateTime::parse_from_rfc3339(&started_at)
+            .context("parsing session start time")?
+            .with_timezone(&Utc);
+        let state: State =
+            serde_json::from_str(&current_state).context("restoring protocol state")?;
+
+        Ok(Ok(Practice {
+            store,
+            clock,
+            detector,
+            session_id,
+            started_at,
+            state,
+        }))
+    }
+
+    pub fn state(&self) -> &State {
+        &self.state
+    }
+
+    pub fn session_id(&self) -> i64 {
+        self.session_id
+    }
+
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// The only entry point for user input.
+    ///
+    /// Order matters: the message is recorded, the guard runs, and only then
+    /// may the caller consider generating. A flagged message ends the practice
+    /// in `Crisis` and no generation happens at all.
+    pub fn submit_user_message(&mut self, text: &str) -> Result<Turn> {
+        if self.state.is_terminal() {
+            bail!("the practice has already ended");
+        }
+
+        let now = self.clock.now();
+        self.record_message("user", text, now)?;
+
+        match self.detector.assess(text) {
+            Assessment::Flagged { kind, guard_version, .. } => {
+                // Deliberately without the message text: enough to prove the
+                // guard fired, not enough to become a store of sensitive
+                // material in its own right.
+                self.store.connection().execute(
+                    "INSERT INTO safety_events (fired_at, trigger_kind, action_taken, guard_version)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        now.to_rfc3339(),
+                        format!("{kind:?}"),
+                        "practice interrupted, crisis resources shown",
+                        guard_version,
+                    ],
+                )?;
+
+                self.apply(Event::RiskDetected { kind })?;
+                Ok(Turn::Crisis { kind })
+            }
+            Assessment::Clear => {
+                if now - self.started_at > Duration::minutes(MAX_PRACTICE_MINUTES) {
+                    self.apply(Event::TimeLimitReached)?;
+                    return Ok(Turn::Ended { reason: EndReason::TimeLimit });
+                }
+                Ok(Turn::Continue { state: self.state.clone() })
+            }
+        }
+    }
+
+    /// Records something the model said. Refuses in states where content must
+    /// be static, so a bug upstream cannot put generated text on the crisis
+    /// screen.
+    pub fn record_assistant_message(&mut self, text: &str) -> Result<()> {
+        if !self.state.allows_generation() {
+            bail!(
+                "generated content is not allowed in state {}",
+                self.state.name()
+            );
+        }
+        let now = self.clock.now();
+        self.record_message("assistant", text, now)?;
+        self.store.save()
+    }
+
+    /// Applies a protocol event, persists the new state and saves the vault.
+    pub fn apply(&mut self, event: Event) -> Result<State> {
+        let next = self
+            .state
+            .next(event)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let now = self.clock.now();
+        self.store.connection().execute(
+            "UPDATE practice_sessions
+             SET current_state = ?1,
+                 states = json_insert(coalesce(states, '[]'), '$[#]', ?2)
+             WHERE id = ?3",
+            params![serde_json::to_string(&next)?, next.name(), self.session_id],
+        )?;
+
+        if let State::Ended { reason } = &next {
+            self.store.connection().execute(
+                "UPDATE practice_sessions SET ended_at = ?1, end_reason = ?2 WHERE id = ?3",
+                params![now.to_rfc3339(), end_reason_str(reason), self.session_id],
+            )?;
+        }
+
+        self.state = next.clone();
+        self.store.save()?;
+        Ok(next)
+    }
+
+    /// Which disclosure, if any, is owed right now.
+    pub fn disclosure_due(&self) -> Result<Option<Disclosure>> {
+        let conn = self.store.connection();
+
+        let any_shown_at: Option<String> = conn
+            .query_row("SELECT max(shown_at) FROM disclosures", [], |r| r.get(0))
+            .unwrap_or(None);
+        let last_practice_at: Option<String> = conn
+            .query_row(
+                "SELECT max(ended_at) FROM practice_sessions WHERE id != ?1",
+                params![self.session_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(None);
+        let last_periodic_at: Option<String> = conn
+            .query_row(
+                "SELECT max(shown_at) FROM disclosures
+                 WHERE kind = 'periodic' AND shown_at >= ?1",
+                params![self.started_at.to_rfc3339()],
+                |r| r.get(0),
+            )
+            .unwrap_or(None);
+
+        let history = History {
+            any_shown_at: parse_opt(any_shown_at)?,
+            last_practice_at: parse_opt(last_practice_at)?,
+            current_session_started_at: Some(self.started_at),
+            last_periodic_at: parse_opt(last_periodic_at)?,
+        };
+
+        Ok(disclosure::due(self.clock.now(), &history))
+    }
+
+    pub fn record_disclosure(&mut self, kind: Disclosure) -> Result<()> {
+        let now = self.clock.now();
+        self.store.connection().execute(
+            "INSERT INTO disclosures (kind, shown_at) VALUES (?1, ?2)",
+            params![kind.as_str(), now.to_rfc3339()],
+        )?;
+        self.store.save()
+    }
+
+    /// The conversation so far, oldest first, as (role, content).
+    pub fn transcript(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.store.connection();
+        let mut stmt = conn.prepare(
+            "SELECT role, content FROM messages
+             WHERE session_id = ?1 ORDER BY said_at, id",
+        )?;
+        let rows = stmt
+            .query_map(params![self.session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn record_message(&self, role: &str, text: &str, at: DateTime<Utc>) -> Result<()> {
+        self.store.connection().execute(
+            "INSERT INTO messages (session_id, role, state, content, said_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                self.session_id,
+                role,
+                self.state.name(),
+                text,
+                at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+fn end_reason_str(reason: &EndReason) -> &'static str {
+    match reason {
+        EndReason::Completed => "completed",
+        EndReason::Abandoned => "abandoned",
+        EndReason::TimeLimit => "time_limit",
+        EndReason::Crisis => "crisis",
+    }
+}
+
+fn parse_opt(value: Option<String>) -> Result<Option<DateTime<Utc>>> {
+    match value {
+        None => Ok(None),
+        Some(raw) => Ok(Some(
+            DateTime::parse_from_rfc3339(&raw)
+                .with_context(|| format!("parsing timestamp {raw:?}"))?
+                .with_timezone(&Utc),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::test_support::TestClock;
+    use crate::protocol::ActionOutcome;
+    use crate::safety::RuleBasedDetector;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "equilibrium-session-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    struct SharedClock(Arc<TestClock>);
+    impl Clock for SharedClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.0.now()
+        }
+    }
+
+    fn practice(dir: &PathBuf, clock: Arc<TestClock>, branch: Branch) -> Practice {
+        let store = Store::open(dir, "passphrase").unwrap();
+        Practice::begin(
+            store,
+            Box::new(SharedClock(clock)),
+            Box::new(RuleBasedDetector),
+            branch,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ordinary_input_continues_the_practice() {
+        let dir = temp_dir("ordinary");
+        let clock = Arc::new(TestClock::at("2026-08-29T10:00:00Z"));
+        let mut p = practice(&dir, clock, Branch::Regular);
+
+        let turn = p
+            .submit_user_message("вчера не смог заставить себя выйти из дома")
+            .unwrap();
+        assert_eq!(turn, Turn::Continue { state: State::Opening });
+
+        let messages: i64 = p
+            .store()
+            .connection()
+            .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(messages, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_flagged_message_interrupts_and_leaves_no_content_in_the_audit_trail() {
+        let dir = temp_dir("crisis");
+        let clock = Arc::new(TestClock::at("2026-08-29T10:00:00Z"));
+        let mut p = practice(&dir, clock, Branch::Regular);
+
+        let turn = p.submit_user_message("я не хочу жить").unwrap();
+        assert_eq!(turn, Turn::Crisis { kind: RiskKind::Suicidality });
+        assert!(matches!(p.state(), State::Crisis { .. }));
+
+        let (kind, action, version): (String, String, String) = p
+            .store()
+            .connection()
+            .query_row(
+                "SELECT trigger_kind, action_taken, guard_version FROM safety_events",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "Suicidality");
+        assert!(!action.is_empty());
+        assert_eq!(version, crate::safety::GUARD_VERSION);
+
+        // The audit row must not carry what the person said.
+        assert!(!kind.contains("жить") && !action.contains("жить"));
+
+        // And generation must be refused while the crisis screen is up.
+        assert!(p.record_assistant_message("что-нибудь утешительное").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_interrupted_practice_resumes_where_it_stopped() {
+        let dir = temp_dir("resume");
+        let clock = Arc::new(TestClock::at("2026-08-29T10:00:00Z"));
+
+        {
+            let mut p = practice(&dir, clock.clone(), Branch::Regular);
+            p.apply(Event::OpeningAcknowledged).unwrap();
+            p.apply(Event::ActionReviewed { outcome: ActionOutcome::Done })
+                .unwrap();
+            assert_eq!(p.state(), &State::Agenda);
+        }
+
+        let store = Store::open(&dir, "passphrase").unwrap();
+        let resumed = Practice::resume(
+            store,
+            Box::new(SharedClock(clock)),
+            Box::new(RuleBasedDetector),
+        )
+        .unwrap();
+
+        match resumed {
+            Ok(p) => assert_eq!(p.state(), &State::Agenda, "state was not restored"),
+            Err(_) => panic!("an unfinished practice should have been found"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_finished_practice_is_not_resumed() {
+        let dir = temp_dir("finished");
+        let clock = Arc::new(TestClock::at("2026-08-29T10:00:00Z"));
+
+        {
+            let mut p = practice(&dir, clock.clone(), Branch::Regular);
+            p.apply(Event::UserLeft).unwrap();
+            assert!(p.state().is_terminal());
+        }
+
+        let store = Store::open(&dir, "passphrase").unwrap();
+        let resumed = Practice::resume(
+            store,
+            Box::new(SharedClock(clock)),
+            Box::new(RuleBasedDetector),
+        )
+        .unwrap();
+        assert!(resumed.is_err(), "a finished practice must not be resumed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_session_ends_at_the_time_cap_rather_than_running_on() {
+        let dir = temp_dir("timecap");
+        let clock = Arc::new(TestClock::at("2026-08-29T10:00:00Z"));
+        let mut p = practice(&dir, clock.clone(), Branch::Regular);
+
+        clock.advance(Duration::minutes(MAX_PRACTICE_MINUTES + 1));
+        let turn = p.submit_user_message("ещё немного поговорим").unwrap();
+        assert_eq!(turn, Turn::Ended { reason: EndReason::TimeLimit });
+
+        let reason: String = p
+            .store()
+            .connection()
+            .query_row(
+                "SELECT end_reason FROM practice_sessions WHERE id = ?1",
+                params![p.session_id()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "time_limit");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_first_run_owes_a_disclosure_and_recording_it_clears_the_debt() {
+        let dir = temp_dir("disclosure");
+        let clock = Arc::new(TestClock::at("2026-08-29T10:00:00Z"));
+        let mut p = practice(&dir, clock.clone(), Branch::Onboarding);
+
+        assert_eq!(p.disclosure_due().unwrap(), Some(Disclosure::FirstRun));
+        p.record_disclosure(Disclosure::FirstRun).unwrap();
+        assert_eq!(p.disclosure_due().unwrap(), None);
+
+        // Three hours of continuous use owes the periodic reminder.
+        clock.advance(Duration::hours(3));
+        assert_eq!(p.disclosure_due().unwrap(), Some(Disclosure::Periodic));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A live walk through the whole stack against the local model.
+    ///
+    /// Ignored by default because it needs Ollama running. Run it with:
+    ///   cargo test --lib -- --ignored --nocapture live_practice
+    #[tokio::test]
+    #[ignore]
+    async fn live_practice() {
+        use crate::critic;
+        use crate::model::{Message, Ollama};
+
+        let dir = temp_dir("live");
+        let clock = Arc::new(TestClock::at("2026-08-30T19:00:00Z"));
+        let model = Ollama::default();
+
+        if !model.is_available().await {
+            eprintln!("Ollama is not running — nothing to check");
+            return;
+        }
+
+        let mut p = practice(&dir, clock, Branch::Regular);
+
+        let script = [
+            "не вышел вчера гулять как планировал. я вообще безнадёжен, у меня никогда ничего не получается",
+            "было поздно и я устал после работы, просто лёг",
+            "наверное мог бы выйти сразу как пришёл, а не ложиться",
+        ];
+
+        println!("\n===== практика =====");
+        for line in script {
+            println!("\n[шаг: {}]", p.state().name());
+            println!("человек: {line}");
+
+            match p.submit_user_message(line).unwrap() {
+                Turn::Crisis { kind } => {
+                    println!("<< гейт сработал: {kind:?}, практика прервана >>");
+                    break;
+                }
+                Turn::Ended { reason } => {
+                    println!("<< практика завершена: {reason:?} >>");
+                    break;
+                }
+                Turn::Continue { state } => {
+                    let history: Vec<Message> = p
+                        .transcript()
+                        .unwrap()
+                        .into_iter()
+                        .map(|(role, content)| Message { role, content })
+                        .collect();
+                    let reply = model
+                        .respond_reviewed(&state, &history)
+                        .await
+                        .unwrap_or_else(|_| critic::fallback(&state).to_string());
+                    println!("программа: {reply}");
+                    assert!(
+                        critic::review(&reply).is_empty(),
+                        "a reply reached the user while failing review: {:?}",
+                        critic::review(&reply)
+                    );
+                    p.record_assistant_message(&reply).unwrap();
+                }
+            }
+        }
+
+        // And the guard, on the same practice.
+        println!("\n[шаг: {}]", p.state().name());
+        println!("человек: иногда думаю что не хочу жить");
+        let turn = p.submit_user_message("иногда думаю что не хочу жить").unwrap();
+        println!("результат: {turn:?}");
+        assert!(matches!(turn, Turn::Crisis { .. }));
+        println!("===== конец =====\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nothing_is_accepted_after_the_practice_ends() {
+        let dir = temp_dir("after-end");
+        let clock = Arc::new(TestClock::at("2026-08-29T10:00:00Z"));
+        let mut p = practice(&dir, clock, Branch::Regular);
+
+        p.apply(Event::UserLeft).unwrap();
+        assert!(p.submit_user_message("ещё кое-что").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

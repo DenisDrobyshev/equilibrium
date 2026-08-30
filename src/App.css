@@ -1,0 +1,260 @@
+:root {
+  --bg: #fbfaf8;
+  --surface: #ffffff;
+  --ink: #1c1b19;
+  --muted: #6b6862;
+  --line: #e3e0da;
+  --accent: #3c5a4a;
+  --warn: #8a6d3b;
+  --error: #8f3a3a;
+
+  font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--ink);
+  background: var(--bg);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17181a;
+    --surface: #1f2124;
+    --ink: #e8e6e2;
+    --muted: #9a968f;
+    --line: #33363a;
+    --accent: #8fb8a3;
+    --warn: #c9a227;
+    --error: #d98a8a;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+main {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+h1,
+h2 {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0 0 0.75rem;
+}
+
+h1 {
+  font-size: 1.6rem;
+}
+
+h2 {
+  font-size: 1.25rem;
+}
+
+.lede {
+  color: var(--muted);
+  margin: 0 0 1rem;
+}
+
+.warn {
+  color: var(--warn);
+  font-size: 0.9rem;
+  margin: 0 0 1rem;
+}
+
+.error {
+  color: var(--error);
+  font-size: 0.9rem;
+  margin-top: 1rem;
+}
+
+.note {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+/* --- Gate --- */
+
+.gate {
+  justify-content: center;
+  gap: 0.5rem;
+  max-width: 540px;
+}
+
+.gate input,
+.controls input {
+  width: 100%;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+}
+
+.disclosure {
+  margin: 0 0 1.5rem;
+  padding-left: 1.1rem;
+  color: var(--muted);
+}
+
+.disclosure li {
+  margin-bottom: 0.5rem;
+}
+
+button {
+  padding: 0.6rem 1rem;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--bg);
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+button.ghost {
+  background: transparent;
+  color: var(--muted);
+  border-color: var(--line);
+}
+
+button.small {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.85rem;
+}
+
+.row {
+  display: flex;
+  gap: 0.6rem;
+}
+
+/* --- Practice --- */
+
+.practice {
+  padding-top: 1rem;
+}
+
+.practice header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 1rem;
+}
+
+.step {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.transcript {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  padding-bottom: 1rem;
+}
+
+.line {
+  padding: 0.7rem 0.9rem;
+  border-radius: 10px;
+  white-space: pre-wrap;
+  max-width: 85%;
+}
+
+.line.assistant {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  align-self: flex-start;
+}
+
+.line.user {
+  background: var(--accent);
+  color: var(--bg);
+  align-self: flex-end;
+}
+
+.line.pending {
+  color: var(--muted);
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0.75rem 0;
+  border-top: 1px solid var(--line);
+}
+
+.controls.plan {
+  flex-direction: column;
+}
+
+.missing {
+  color: var(--warn);
+  font-size: 0.85rem;
+}
+
+.composer {
+  display: flex;
+  gap: 0.6rem;
+  align-items: flex-end;
+  padding-top: 0.75rem;
+}
+
+.composer textarea {
+  flex: 1;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  resize: vertical;
+}
+
+/* --- Crisis: deliberately plain, nothing to click past quickly --- */
+
+.crisis {
+  justify-content: center;
+  max-width: 540px;
+}
+
+.crisis ul {
+  list-style: none;
+  padding: 0;
+  margin: 1.5rem 0;
+}
+
+.crisis li {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.crisis li span {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
