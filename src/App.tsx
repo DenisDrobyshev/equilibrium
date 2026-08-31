@@ -22,6 +22,19 @@ type Situation = {
   consequence: string | null;
   ready: boolean;
 };
+type StoredSituation = {
+  trigger: string;
+  feeling: string | null;
+  avoidance: string | null;
+  consequence: string | null;
+  recorded_at: string;
+};
+type Repeated = { kind: string; text: string; count: number };
+type HistoryView = {
+  situations: StoredSituation[];
+  repeated: Repeated[];
+  problems: ProblemItem[];
+};
 type VaultStatus = {
   resumed: boolean;
   needs_onboarding: boolean;
@@ -53,6 +66,7 @@ export default function App() {
   const [view, setView] = useState<View | null>(null);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [history, setHistory] = useState<HistoryView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const bottom = useRef<HTMLDivElement>(null);
 
@@ -101,6 +115,11 @@ export default function App() {
     setInput("");
     const result = await run(() => invoke<View>("record_problem", { text }));
     if (result) setView(result);
+  }
+
+  async function openHistory() {
+    const result = await run(() => invoke<HistoryView>("history"));
+    if (result) setHistory(result);
   }
 
   async function recordGoal() {
@@ -267,13 +286,79 @@ export default function App() {
     );
   }
 
+  if (history) {
+    const kindLabel: Record<string, string> = {
+      trigger: "перед этим",
+      feeling: "чувство",
+      avoidance: "вместо этого",
+    };
+    return (
+      <main className="practice">
+        <header>
+          <span className="step">Записи</span>
+          <button className="ghost small" onClick={() => setHistory(null)}>
+            Назад
+          </button>
+        </header>
+
+        {history.repeated.length > 0 && (
+          <div className="chain">
+            <span className="chain-title">Что повторяется</span>
+            <ul className="repeats">
+              {history.repeated.map((r, i) => (
+                <li key={i}>
+                  <span>{r.text}</span>
+                  <em>
+                    {kindLabel[r.kind] ?? r.kind}, {r.count} раза
+                  </em>
+                </li>
+              ))}
+            </ul>
+            <p className="chain-note">
+              Это просто подсчёт повторов в ваших записях, а не вывод о вас.
+              Что с этим делать — решаете вы.
+            </p>
+          </div>
+        )}
+
+        <div className="transcript">
+          {history.situations.length === 0 && (
+            <p className="chain-note">Пока ничего не записано.</p>
+          )}
+          {history.situations.map((s, i) => (
+            <div className="chain" key={i}>
+              <span className="chain-title">
+                {s.recorded_at.slice(0, 10)}
+              </span>
+              <dl>
+                <dt>Перед этим</dt>
+                <dd>{s.trigger || "—"}</dd>
+                <dt>Почувствовали</dt>
+                <dd>{s.feeling || "—"}</dd>
+                <dt>Сделали вместо</dt>
+                <dd>{s.avoidance || "—"}</dd>
+                <dt>Привело к</dt>
+                <dd>{s.consequence || "—"}</dd>
+              </dl>
+            </div>
+          ))}
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="practice">
       <header>
         <span className="step">{STEP_LABEL[view.state] ?? view.state}</span>
-        <button className="ghost small" onClick={() => advance("user_left")}>
-          Закончить
-        </button>
+        <div className="row">
+          <button className="ghost small" onClick={openHistory} disabled={busy}>
+            Записи
+          </button>
+          <button className="ghost small" onClick={() => advance("user_left")}>
+            Закончить
+          </button>
+        </div>
       </header>
 
       {view.hint && <p className="hint">{view.hint}</p>}

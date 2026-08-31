@@ -18,6 +18,8 @@ use crate::protocol::{
 };
 use crate::safety::{self, RuleBasedDetector};
 use crate::session::{Branch, Practice, Turn};
+#[allow(unused_imports)]
+use crate::session::{RepeatedElement, StoredSituation};
 
 pub struct AppState {
     practice: Mutex<Option<Practice>>,
@@ -192,7 +194,17 @@ pub async fn send_message(
     match turn {
         // The guard fired or time ran out: no generation at all.
         Turn::Crisis { .. } | Turn::Ended { .. } => view(&state),
-        Turn::Continue { .. } => {
+        Turn::Continue { state: protocol_state } => {
+            // Telling the program what happened with the planned action *is*
+            // acknowledging the opening. Making the person press "Next" after
+            // answering leaves the practice stuck on one step, which is what it
+            // did on first use.
+            if matches!(protocol_state, State::Opening) {
+                let mut guard = state.practice.lock().unwrap();
+                let practice = guard.as_mut().ok_or("no practice is open")?;
+                let _ = practice.apply(Event::OpeningAcknowledged);
+            }
+
             generate_reply(&state).await?;
             extract_situation_if_relevant(&state).await?;
             view(&state)
@@ -254,6 +266,64 @@ pub async fn record_problem(
     }
     generate_reply(&state).await?;
     view(&state)
+}
+
+#[derive(Serialize)]
+pub struct HistoryView {
+    pub situations: Vec<StoredSituationView>,
+    pub repeated: Vec<RepeatedView>,
+    pub problems: Vec<ProblemView>,
+}
+
+#[derive(Serialize)]
+pub struct StoredSituationView {
+    pub trigger: String,
+    pub feeling: Option<String>,
+    pub avoidance: Option<String>,
+    pub consequence: Option<String>,
+    pub recorded_at: String,
+}
+
+#[derive(Serialize)]
+pub struct RepeatedView {
+    pub kind: String,
+    pub text: String,
+    pub count: usize,
+}
+
+/// Everything recorded so far: the situations themselves and what repeats
+/// across them. The person's own material, shown back to them.
+#[tauri::command]
+pub async fn history(state: TauriState<'_, AppState>) -> CmdResult<HistoryView> {
+    let guard = state.practice.lock().unwrap();
+    let practice = guard.as_ref().ok_or("no practice is open")?;
+
+    Ok(HistoryView {
+        situations: practice
+            .recorded_situations()
+            .map_err(err)?
+            .into_iter()
+            .map(|s| StoredSituationView {
+                trigger: s.trigger,
+                feeling: s.feeling,
+                avoidance: s.avoidance,
+                consequence: s.consequence,
+                recorded_at: s.recorded_at,
+            })
+            .collect(),
+        repeated: practice
+            .repeated_elements()
+            .map_err(err)?
+            .into_iter()
+            .map(|r| RepeatedView { kind: r.kind, text: r.text, count: r.count })
+            .collect(),
+        problems: practice
+            .problems_with_ids()
+            .map_err(err)?
+            .into_iter()
+            .map(|(id, text)| ProblemView { id, text })
+            .collect(),
+    })
 }
 
 /// Stores the goal, then advances the step.

@@ -27,6 +27,7 @@ pub fn run() {
             commands::record_goal,
             commands::record_ratings,
             commands::advance,
+            commands::history,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

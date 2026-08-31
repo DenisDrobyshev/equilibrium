@@ -394,6 +394,65 @@ impl Practice {
         self.store.save()
     }
 
+    /// Confirmed situations, newest first.
+    pub fn recorded_situations(&self) -> Result<Vec<StoredSituation>> {
+        let conn = self.store.connection();
+        let mut stmt = conn.prepare(
+            "SELECT trigger, feeling, avoidance, consequence, recorded_at
+             FROM situations WHERE confirmed = 1 ORDER BY recorded_at DESC, id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(StoredSituation {
+                    trigger: r.get(0)?,
+                    feeling: r.get(1)?,
+                    avoidance: r.get(2)?,
+                    consequence: r.get(3)?,
+                    recorded_at: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// What has come up more than once across confirmed situations.
+    ///
+    /// Deliberately plain counting, not a network model: a stable idiographic
+    /// network needs 75–100 observations and no more than six nodes, and with
+    /// less than that a sparse graph says "not enough data", not "no link".
+    /// Counting repetitions makes no claim it cannot support.
+    pub fn repeated_elements(&self) -> Result<Vec<RepeatedElement>> {
+        let situations = self.recorded_situations()?;
+        let mut counts: std::collections::HashMap<(&'static str, String), usize> =
+            std::collections::HashMap::new();
+
+        for situation in &situations {
+            let mut tally = |kind: &'static str, value: &Option<String>| {
+                if let Some(text) = value {
+                    let key = normalise_phrase(text);
+                    if !key.is_empty() {
+                        *counts.entry((kind, key)).or_insert(0) += 1;
+                    }
+                }
+            };
+            tally("trigger", &Some(situation.trigger.clone()));
+            tally("avoidance", &situation.avoidance);
+            tally("feeling", &situation.feeling);
+        }
+
+        let mut repeated: Vec<RepeatedElement> = counts
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|((kind, text), count)| RepeatedElement {
+                kind: kind.to_string(),
+                text,
+                count,
+            })
+            .collect();
+        repeated.sort_by(|a, b| b.count.cmp(&a.count).then(a.text.cmp(&b.text)));
+        Ok(repeated)
+    }
+
     /// Difficulties with their ids, for recording ratings against them.
     pub fn problems_with_ids(&self) -> Result<Vec<(i64, String)>> {
         let conn = self.store.connection();
@@ -445,6 +504,37 @@ impl Practice {
         )?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredSituation {
+    pub trigger: String,
+    pub feeling: Option<String>,
+    pub avoidance: Option<String>,
+    pub consequence: Option<String>,
+    pub recorded_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepeatedElement {
+    /// "trigger", "feeling" or "avoidance".
+    pub kind: String,
+    pub text: String,
+    pub count: usize,
+}
+
+/// Case and punctuation folded, so "Промолчал." and "промолчал" count as one.
+/// Nothing cleverer: stemming would merge phrases the person means to keep
+/// apart, and this is their material, not the program's.
+fn normalise_phrase(text: &str) -> String {
+    text.to_lowercase()
+        .replace('ё', "е")
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn end_reason_str(reason: &EndReason) -> &'static str {
@@ -832,6 +922,50 @@ mod tests {
             .unwrap();
         assert_eq!(when, "2026-08-31T10:00");
         assert_eq!(place, "рабочий чат");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn counts_what_repeats_across_situations() {
+        let dir = temp_dir("repeats");
+        let clock = Arc::new(TestClock::at("2026-08-30T10:00:00Z"));
+        let mut p = practice(&dir, clock, Branch::Regular);
+
+        let silence = |trigger: &str| SituationDraft {
+            trigger: trigger.into(),
+            feeling: Some("сжалось внутри".into()),
+            avoidance: Some("Промолчал.".into()),
+            consequence: None,
+        };
+
+        p.record_situation(&silence("планёрка")).unwrap();
+        p.record_situation(&silence("разговор с начальником")).unwrap();
+        p.record_situation(&SituationDraft {
+            trigger: "звонок маме".into(),
+            feeling: None,
+            avoidance: Some("не перезвонил".into()),
+            consequence: None,
+        })
+        .unwrap();
+
+        let repeated = p.repeated_elements().unwrap();
+
+        // Case and punctuation must not split one behaviour into two.
+        let avoidance = repeated
+            .iter()
+            .find(|r| r.kind == "avoidance" && r.text == "промолчал")
+            .expect("the repeated avoidance should have been counted");
+        assert_eq!(avoidance.count, 2);
+
+        // Things seen once are not patterns and must not be listed.
+        assert!(
+            !repeated.iter().any(|r| r.text.contains("не перезвонил")),
+            "a single occurrence was reported as a pattern"
+        );
+        assert!(!repeated.iter().any(|r| r.text == "планерка"));
+
+        assert_eq!(p.recorded_situations().unwrap().len(), 3);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
